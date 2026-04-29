@@ -251,17 +251,17 @@ export default function App() {
         //   return;
         // }
 
-        // ===== HUGGING FACE =====
-        const response = await fetch(`${API_BASE}/health`);
+        // ===== HUGGING FACE (Gradio) =====
+        const response = await fetch(`${API_BASE}/config`);
 
         if (!isMounted) return;
 
         if (response.ok) {
-          setApiStatus({ state: "ready", detail: "Hugging Face API reachable" });
+          setApiStatus({ state: "ready", detail: "Gradio API reachable" });
           return;
         }
 
-        setApiStatus({ state: "degraded", detail: "API responded but not OK" });
+        setApiStatus({ state: "degraded", detail: `Gradio config responded with status ${response.status}` });
       } catch {
         if (isMounted) {
           setApiStatus({ state: "offline", detail: "API not reachable" });
@@ -452,32 +452,70 @@ function HomePage({ isOnline, apiStatus, onSaveResult }) {
       //   features: payloadFeatures
       // };
 
-      // ===== HUGGING FACE =====
-      const response = await fetch(`${API_BASE}/predict`, {
+      // ===== HUGGING FACE (Gradio SSE v3) =====
+      const ispA = String(datasetRow.asn1).trim();
+      const ispB = String(datasetRow.asn2).trim();
+
+      // Step 1: submit the job to Gradio named endpoint "predict"
+      const startRes = await fetch(`${API_BASE}/gradio_api/call/predict`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ispA: String(datasetRow.asn1).trim(),
-          ispB: String(datasetRow.asn2).trim(),
-          model: DEFAULT_MODEL_VALUE,
-          features: payloadFeatures
-        })
+        body: JSON.stringify({ data: [ispA, ispB, payloadFeatures] })
       });
 
-      if (!response.ok) {
-        const detail = await response.text().catch(() => null);
-        throw new Error(detail || "Prediction request failed.");
+      if (!startRes.ok) {
+        const detail = await startRes.text().catch(() => null);
+        throw new Error(detail ? `Gradio call failed: ${detail}` : `Gradio call failed with status ${startRes.status}.`);
       }
 
-      const result = await response.json();
+      const startJson = await startRes.json();
+      const eventId = startJson?.event_id;
+      if (!eventId) {
+        throw new Error("Gradio did not return an event_id. The backend may be unavailable.");
+      }
+
+      // Step 2: read the SSE stream result
+      const streamRes = await fetch(`${API_BASE}/gradio_api/call/predict/${eventId}`);
+
+      if (!streamRes.ok) {
+        const detail = await streamRes.text().catch(() => null);
+        throw new Error(detail ? `Gradio stream failed: ${detail}` : `Gradio stream failed with status ${streamRes.status}.`);
+      }
+
+      const sseText = await streamRes.text();
+
+      // Parse SSE lines and find the last payload containing output.data
+      const dataLines = sseText
+        .split("\n")
+        .filter((line) => line.startsWith("data: "))
+        .map((line) => line.slice("data: ".length).trim())
+        .filter(Boolean);
+
+      let output = null;
+      for (let i = dataLines.length - 1; i >= 0; i--) {
+        try {
+          const payload = JSON.parse(dataLines[i]);
+          if (Array.isArray(payload?.output?.data)) {
+            output = payload.output.data;
+            break;
+          }
+        } catch {
+          // skip non-JSON lines
+        }
+      }
+
+      if (!output) {
+        throw new Error("No valid output received from the Gradio backend. Please try again.");
+      }
+
       const nextResult = {
-        ispA: String(datasetRow.asn1).trim(),
-        ispB: String(datasetRow.asn2).trim(),
+        ispA,
+        ispB,
         model: DEFAULT_MODEL_LABEL,
-        label: result?.label ?? "Unknown",
-        probability: Number(result?.probability ?? 0) || 0,
+        label: output[0] ?? "Unknown",
+        probability: Number(output[1] ?? 0) || 0,
         createdAt: new Date().toISOString(),
-        features: payloadFeatures
+        features: output[2] ?? payloadFeatures
       };
 
       onSaveResult(nextResult);
